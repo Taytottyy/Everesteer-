@@ -1,77 +1,56 @@
-"""Shared data loading and offline scoring for the Everesteer hackathon."""
+"""Offline experiments: baseline, per-target models, blends, benchmark orthogonalisation."""
+import time
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, rankdata
+import lightgbm as lgb
+from scipy.stats import rankdata
+from common import load_train, split, evaluate, proxy_core, TARGET
 
-TARGET = "target_everest"
-GAP = 20          # expeds between fit and hold-out (target horizon)
-HOLDOUT = 1000    # most recent expeds held out for scoring
-W = {"corr": 1.0, "aimc": 2.0, "ncorr": 1.0}  # from explain_scoring()
+PARAMS = dict(n_estimators=1500, learning_rate=0.02, num_leaves=31, max_depth=6,
+              colsample_bytree=0.1, subsample=0.8, subsample_freq=1,
+              min_child_samples=200, verbose=-1, n_jobs=-1)
 
+df, feats = load_train()
+fit, test = split(df)
+core = proxy_core(fit, feats)
+print(f"fit {fit['era'].nunique()} expeds / {len(fit)} rows, test {test['era'].nunique()} expeds")
 
-def load_train():
-    df = pd.read_parquet("futures_train.parquet")
-    bench = pd.read_parquet("benchmark_futures_train.parquet")["v1_sherpa"]
-    df["v1_sherpa"] = bench.reindex(df.index).values
-    feats = [c for c in df.columns if c.startswith("feature_")]
-    df[feats] = df[feats].astype("float32").replace(-1, np.nan)
-    df["era"] = df["exped"].str[6:].astype(int)
-    return df, feats
+evaluate(test, test["v1_sherpa"].values, core, "benchmark v1_sherpa")
 
+# target correlations to pick diverse aux targets
+tcols = [c for c in df.columns if c.startswith("target_")]
+tc = fit[tcols].corr()[TARGET].sort_values()
+print(tc.round(2).to_string())
 
-def split(df):
-    eras = np.sort(df["era"].unique())
-    test_start = eras[-HOLDOUT]
-    fit = df[df["era"] < test_start - GAP]
-    test = df[df["era"] >= test_start]
-    return fit, test
+preds = {}
+for t in [TARGET] + [c for c in tc.index if c != TARGET][:0]:
+    pass
 
+targets = [TARGET, "target_Tougroute"] + [c for c in tc.index if c != TARGET][:4]
+for t in dict.fromkeys(targets):
+    tt = time.time()
+    m = fit[t].notna()
+    model = lgb.LGBMRegressor(**PARAMS).fit(fit.loc[m, feats], fit.loc[m, t])
+    preds[t] = model.predict(test[feats])
+    evaluate(test, preds[t], core, f"lgbm {t[7:]} ({time.time()-tt:.0f}s)")
 
-# --- per-exped kernels (mirror the server: rank-gauss preds, centre target, signed ^1.5) ---
-def _gauss(x):
-    return norm.ppf((rankdata(x) - 0.5) / len(x))
-
-
-def _pow(x):
-    return np.sign(x) * np.abs(x) ** 1.5
-
-
-def _corr(p, y):
-    a, b = _pow(p), _pow(y - y.mean())
-    if a.std() == 0 or b.std() == 0:
-        return 0.0
-    return float(np.corrcoef(a, b)[0, 1])
+# benchmark proxy (live benchmark is withheld from event keys)
+bm = lgb.LGBMRegressor(**PARAMS).fit(fit[feats], fit["v1_sherpa"])
+bench_proxy = bm.predict(test[feats])
+print("bench proxy corr to true bench:",
+      np.corrcoef(rankdata(bench_proxy), rankdata(test["v1_sherpa"]))[0, 1].round(3))
 
 
-def era_scores(pred, y, bench, core):
-    g = _gauss(pred)
-    corr = _corr(g, y)
-    bg = _gauss(bench)
-    resid = g - (g @ bg) / (bg @ bg) * bg
-    aimc = float(np.mean(resid * (y - y.mean())))
-    X = np.column_stack([np.nan_to_num(core, nan=np.nanmean(core)), np.ones(len(g))])
-    lam = 1e-3 * np.trace(X.T @ X) / X.shape[1]
-    beta = np.linalg.solve(X.T @ X + lam * np.eye(X.shape[1]), X.T @ g)
-    ncorr = _corr(g - X @ beta, y)
-    return corr, aimc, ncorr
+def rank_by_era(x):
+    return pd.Series(x, index=test.index).groupby(test["era"].values).rank(pct=True).values
 
 
-def evaluate(test, pred, core_feats, label=""):
-    rows = []
-    for _, idx in test.groupby("era").indices.items():
-        sub = test.iloc[idx]
-        rows.append(era_scores(pred[idx], sub[TARGET].values, sub["v1_sherpa"].values,
-                               sub[core_feats].values))
-    r = pd.DataFrame(rows, columns=["corr", "aimc", "ncorr"])
-    m = r.mean()
-    score = W["corr"] * m["corr"] + W["aimc"] * m["aimc"] + W["ncorr"] * m["ncorr"]
-    bc = np.corrcoef(rankdata(pred), rankdata(test["v1_sherpa"]))[0, 1]
-    print(f"{label:28s} CORR {m['corr']:+.4f}  AIMC {m['aimc']:+.4f}  NCORR {m['ncorr']:+.4f}"
-          f"  SCORE {score:+.4f}  sharpe {r['corr'].mean()/r['corr'].std():.2f}  bench_corr {bc:.2f}")
-    return score
+R = {k: rank_by_era(v) for k, v in preds.items()}
+bp = rank_by_era(bench_proxy)
+evaluate(test, sum(R.values()) / len(R), core, "blend all targets")
+main = 0.5 * R[TARGET] + 0.5 * sum(v for k, v in R.items() if k != TARGET) / (len(R) - 1)
+evaluate(test, main, core, "blend 50/50 main/aux")
+for a in [0.25, 0.5, 0.75, 1.0]:
+    evaluate(test, main - a * bp, core, f"blend - {a} bench_proxy")
 
-
-def proxy_core(fit, feats, k=10):
-    """Stand-in for the unpublished 10-feature NCORR core set."""
-    c = fit[feats].corrwith(fit[TARGET]).abs().sort_values(ascending=False)
-    return c.index[:k].tolist()
+pd.DataFrame(R, index=test.index).assign(bench_proxy=bp).to_parquet("holdout_preds.parquet")

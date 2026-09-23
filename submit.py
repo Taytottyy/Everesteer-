@@ -1,59 +1,65 @@
-"""Fit candidate blends on the full train split and save each as a cloudpickled predict().
+"""Predict with saved .pkl models and submit to whichever lane is open.
 
-usage: python build.py            -> builds every candidate into models/<name>.pkl
+usage:
+  python submit.py practice everest main_aux     # practice board (validation split, free)
+  python submit.py round everest main_aux        # open event round (live split, uses uploads)
+Needs EIQ_API_KEY in the environment.
 """
+import json
 import os
 import sys
 import cloudpickle
-import numpy as np
 import pandas as pd
-import lightgbm as lgb
+from everestapi import EverestAPI
 
-PARAMS = dict(n_estimators=1500, learning_rate=0.02, num_leaves=31, max_depth=6,
-              colsample_bytree=0.1, subsample=0.8, subsample_freq=1,
-              min_child_samples=200, verbose=-1, n_jobs=-1)
-
-CANDIDATES = {
-    "everest": {"target_everest": 1.0},
-    "main_aux": {"target_everest": 0.5, "target_Tougroute": 0.1, "target_Tiskiouine": 0.1,
-                 "target_Saghro": 0.1, "target_Gourza": 0.1, "target_Ayachi": 0.1},
-    "all15": None,  # equal weight over every target, filled in below
-    "lowbench": {"target_everest": 0.4, "target_Ayachi": 0.3, "target_Tiskiouine": 0.15,
-                 "target_Saghro": 0.15},
-}
+PYV = f"{sys.version_info.major}.{sys.version_info.minor}"
+client = EverestAPI(api_key=os.environ["EIQ_API_KEY"],
+                    base_url=os.environ.get("EIQ_BASE_URL", "https://hackathon.everesteer.ai"))
 
 
-def make_predict(models, weights, feats):
-    def predict(live_features):
-        X = live_features.reindex(columns=feats).astype("float32").replace(-1, np.nan)
-        out = np.zeros(len(X))
-        for t, w in weights.items():
-            out += w * pd.Series(models[t].predict(X)).rank(pct=True).values
-        return pd.Series(out, index=live_features.index).rank(pct=True).to_frame("prediction")
-    return predict
+NAMES = "models/names.json"
+
+
+def model_name(label):
+    """Return the server-assigned name for our private label, creating the model once."""
+    names = json.load(open(NAMES)) if os.path.exists(NAMES) else {}
+    if label not in names:
+        res = client.create_model(name=f"ty-{label}")
+        print("create_model", label, res)
+        names[label] = res.get("name") or res.get("id")
+        json.dump(names, open(NAMES, "w"), indent=1)
+    return names[label]
 
 
 def main():
-    df = pd.read_parquet("futures_train.parquet")
+    lane, labels = sys.argv[1], sys.argv[2:]
+    cad = client.get_started().get("cadence") or {}
+    if lane == "round":
+        if cad.get("intake_fenced") or not cad.get("open_window"):
+            sys.exit(f"No round open (phase={cad.get('phase')}). Not submitting.")
+        split, submit = "live", client.submit_event_predictions
+    else:
+        split, submit = "validation", client.submit_validation_diagnostics
+    print(f"phase={cad.get('phase')} open_window={cad.get('open_window')} -> {split}")
+
+    df = pd.read_parquet(client.download_dataset(split=split))
     feats = [c for c in df.columns if c.startswith("feature_")]
-    targets = [c for c in df.columns if c.startswith("target_")]
-    CANDIDATES["all15"] = {t: 1 / len(targets) for t in targets}
-    X = df[feats].astype("float32").replace(-1, np.nan)
+    ids = df["id"] if "id" in df.columns else df.index
+    X = df[feats].set_axis(ids.values)
 
-    needed = sorted({t for w in CANDIDATES.values() for t in w})
-    models = {}
-    for t in needed:
-        m = df[t].notna().values
-        models[t] = lgb.LGBMRegressor(**PARAMS).fit(X[m], df.loc[m, t])
-        print("fit", t, flush=True)
-
-    os.makedirs("models", exist_ok=True)
-    for name, w in CANDIDATES.items():
-        fn = make_predict({t: models[t] for t in w}, w, feats)
-        with open(f"models/{name}.pkl", "wb") as f:
-            cloudpickle.dump(fn, f, protocol=5)
-        print("saved", name)
-    print("python", f"{sys.version_info.major}.{sys.version_info.minor}")
+    for label in labels:
+        pkl = f"models/{label}.pkl"
+        with open(pkl, "rb") as f:
+            predict = cloudpickle.load(f)
+        # rank within each exped so the blend is scored per cross-section
+        raw = predict(X).iloc[:, 0].values
+        pred = pd.Series(raw).groupby(df["exped"].values).rank(pct=True).values
+        out = pd.DataFrame({"id": ids.values, "prediction": pred})
+        assert out["prediction"].between(0, 1).all() and out["id"].is_unique
+        name = model_name(label)
+        res = submit(model_id=name, predictions=out, model_pkl=pkl,
+                     model_pkl_python_version=PYV)
+        print(label, "->", name, res)
 
 
 if __name__ == "__main__":

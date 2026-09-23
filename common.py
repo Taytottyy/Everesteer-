@@ -1,4 +1,5 @@
 """Shared data loading and offline scoring for the Everesteer hackathon."""
+import os
 import numpy as np
 import pandas as pd
 from scipy.stats import norm, rankdata
@@ -11,7 +12,11 @@ W = {"corr": 1.0, "aimc": 2.0, "ncorr": 1.0}  # from explain_scoring()
 
 def load_train():
     df = pd.read_parquet("futures_train.parquet")
-    bench = pd.read_parquet("benchmark_futures_train.parquet")["v1_sherpa"]
+    import glob
+    bpath = next(p for p in ["benchmark_futures_train.parquet",
+                             "futures_train_benchmark_models.parquet", *glob.glob("*train*bench*.parquet")]
+                 if os.path.exists(p))  # SDK versions save this under different names
+    bench = pd.read_parquet(bpath)["v1_sherpa"]
     df["v1_sherpa"] = bench.reindex(df.index).values
     feats = [c for c in df.columns if c.startswith("feature_")]
     df[feats] = df[feats].astype("float32").replace(-1, np.nan)

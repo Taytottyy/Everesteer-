@@ -14,7 +14,8 @@ from everestapi import EverestAPI
 
 PYV = f"{sys.version_info.major}.{sys.version_info.minor}"
 NAMES = "models/names.json"
-client = EverestAPI(api_key=os.environ["EIQ_API_KEY"], base_url="https://hackathon.everesteer.ai")
+DONE = "models/submitted.json"  # open_window -> {model: upload_id}; stops paid re-uploads
+client = EverestAPI(api_key=os.environ["EIQ_API_KEY"], base_url=os.environ.get("EIQ_BASE_URL", "https://hackathon.everesteer.ai"))
 
 
 def load(label):
@@ -46,12 +47,21 @@ def main():
     feats = [c for c in live.columns if c.startswith("feature_")]
     ids = live["id"] if "id" in live.columns else live.index
     X = live[feats].set_axis(ids.values)
-    names = json.load(open(NAMES))
+    names = json.load(open(NAMES)) if os.path.exists(NAMES) else {}
+    done = json.load(open(DONE)) if os.path.exists(DONE) else {}
+    round_done = done.setdefault(cad["open_window"], {})
+    # live may label cross-sections exped_NNNN or era_NNN; rank within whichever is present
+    gcol = next((c for c in ("exped", "era") if c in live.columns), None)
+    groups = live[gcol].values if gcol else pd.Series(0, index=range(len(live))).values
+    print("cross-section column:", gcol, "| rows", len(live))
 
     for label in sys.argv[1:]:
         predict, pkl, key = load(label)
+        if key in round_done:
+            print(f"{key:20s} already submitted this round ({round_done[key]}), skipping")
+            continue
         raw = predict(X).iloc[:, 0].values
-        pred = pd.Series(raw).groupby(live["exped"].values).rank(pct=True).values
+        pred = pd.Series(raw).groupby(groups).rank(pct=True).values
         out = pd.DataFrame({"id": ids.values, "prediction": pred})
         assert out["prediction"].between(0, 1).all() and out["id"].is_unique
         if key not in names:
@@ -59,6 +69,8 @@ def main():
             json.dump(names, open(NAMES, "w"), indent=1)
         res = client.submit_event_predictions(model_id=names[key], predictions=out,
                                               model_pkl=pkl, model_pkl_python_version=PYV)
+        round_done[key] = res.get("upload_id")
+        json.dump(done, open(DONE, "w"), indent=1)
         print(f"{key:20s} -> {names[key]:32s} upload {res.get('upload_id')} "
               f"remaining {res.get('uploads_remaining')}")
 
